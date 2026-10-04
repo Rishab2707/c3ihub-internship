@@ -1,0 +1,24 @@
+{
+  "name": "duoram-two-server-demo",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "demo": "node scripts/demo.js",
+    "dev": "concurrently \"npm:server:a\" \"npm:server:b\" \"npm:client\"",
+    "server:a": "node server/server.js a",
+    "server:b": "node server/server.js b",
+    "client": "vite --host 0.0.0.0",
+    "test:crypto": "node --test --test-concurrency=1 test/crypto-protocol.test.js test/server-gate.test.js",
+    "build": "vite build"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "6.1.1",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "vite": "8.3.2"
+  },
+  "devDependencies": {
+    "concurrently": "10.0.5"
+  }
+}
