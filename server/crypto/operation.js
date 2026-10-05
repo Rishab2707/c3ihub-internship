@@ -2,6 +2,7 @@ import { randomBytes } from 'node:crypto';
 import { waitForDpfControl } from './dpf-control-store.js';
 import { bitsToIndex, encryptCspirResponse, decryptCspirResponse } from './cspir.js';
 import { waitForReadExchange } from './read-round-store.js';
+import { DPF_VALUE_BYTE } from './duoram-dpf.js';
 
 export function shiftDpfEvaluation(evaluation, shift) {
   if (!Number.isInteger(shift) || shift < 0 || shift >= evaluation.flags.length) throw new TypeError('Invalid DPF shift');
@@ -32,7 +33,7 @@ async function applyPointOperation({ operation, evaluation, valueShare, database
   // new value into an XOR-shared delta. No party opens the old bit or delta.
   const oldBitShare = readShare;
   const correctionShare = Buffer.from(evaluation.finalCorrectionShare);
-  correctionShare[0] ^= oldBitShare ^ valueShare;
+  correctionShare[DPF_VALUE_BYTE] ^= oldBitShare ^ valueShare;
   // The final exchange is separate from the d tree-level exchanges. This
   // opens only the deferred DPF correction, as in corrected_update_vector
   // in the C++ reference. It never opens the shared value or address.
@@ -42,10 +43,11 @@ async function applyPointOperation({ operation, evaluation, valueShare, database
   }
   const peerWord = Buffer.from(peer.wordShare, 'hex');
   for (let byte = 0; byte < correctionShare.length; byte++) correctionShare[byte] ^= peerWord[byte];
-  // Binary storage is the low-bit projection of the reference's 128-bit
-  // value-DPF update. All public positions are traversed on both parties.
+  // Project a non-control seed bit of the reference's 128-bit value-DPF.
+  // Byte zero's low bit is cleared by AES expansion and cannot mask a delta.
+  // All public positions are traversed on both parties.
   const updated = databaseShare.map((bit, index) => bit ^
-    (evaluation.values[index][0] & 1) ^ (pointShare[index] & (correctionShare[0] & 1)));
+    (evaluation.values[index][DPF_VALUE_BYTE] & 1) ^ (pointShare[index] & (correctionShare[DPF_VALUE_BYTE] & 1)));
   // Keep the share staged until the coordinator has confirmed that both
   // parties completed the MPC operation. The server commits it afterward.
   return { ok: true, validityShare, updatedDatabaseShare: updated };

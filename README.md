@@ -38,7 +38,9 @@ The three retained checks cover DPF generation/evaluation, online shifting and d
 - Replacement privately reads the old bit, derives a shared XOR delta, exchanges the deferred DPF value correction, and applies local corrected leaf values. Both servers stage their database shares before commit.
 - Uncertain write commits and changed peer process identities close the runtime gate. Restart both processes to discard and reset their in-memory state.
 
-The backend cryptography is handwritten JavaScript using Node built-ins: Chou–Orlandi-style base OT in a 3072-bit subgroup, IKNP-style OT extension, HMAC/AES expansion, and OT-generated Boolean Beaver triples. Direct two-direction OT multiplication generates the random triples; actual DPF operands are multiplied by consuming those triples and opening only masked differences. No external npm cryptography package or helper server is used. These are cryptographic constructions, but passing correctness checks does not establish their security.
+The backend cryptography is handwritten JavaScript using Node built-ins: Chou–Orlandi-style base OT in a 3072-bit subgroup, IKNP-style OT extension, fixed-key AES-128 Davies–Meyer DPF expansion matching `cpp-implementation/prg.cpp`, and OT-generated Boolean Beaver triples. DPF child controls are extracted and cleared before seed corrections; binary updates project a remaining seed bit. HMAC-SHA256 remains in the OT row-key derivation. Direct two-direction OT multiplication generates the random triples; actual DPF operands are multiplied by consuming those triples and opening only masked differences. No external npm cryptography package or helper server is used. These are cryptographic constructions, but passing correctness checks does not establish their security.
+
+AES DPF keys use version 3 and wire protocol `duoram-preprocessed-cspir-triples-aes-bit-v11`. Earlier HMAC keys are rejected. Restart both servers together after upgrading; preprocessing and database shares are in memory and are reset on restart. See [the AES expansion notes](docs/aes-dpf-expansion.md).
 
 ## Security and deployment
 

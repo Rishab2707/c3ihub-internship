@@ -24,7 +24,7 @@ const peerUrl = new URL(process.env.DUORAM_PEER_URL || `${defaultPeerScheme}://1
 const SIZE = Number(process.env.DB_SIZE || 2 ** 16);
 if (!Number.isSafeInteger(SIZE) || SIZE < 1 || SIZE > 1_000_000) throw new Error('DB_SIZE must be an integer from 1 to 1,000,000');
 const DOMAIN_BITS = Math.max(1, Math.ceil(Math.log2(SIZE)));
-const PROTOCOL_WIRE_VERSION = 'duoram-preprocessed-cspir-triples-bit-v10';
+const PROTOCOL_WIRE_VERSION = 'duoram-preprocessed-cspir-triples-aes-bit-v11';
 const INSTANCE_ID = randomUUID();
 let peerInstanceId = null;
 const PEER_TOKEN = process.env.DUORAM_PEER_TOKEN || '';

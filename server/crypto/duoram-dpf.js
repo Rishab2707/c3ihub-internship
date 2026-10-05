@@ -1,7 +1,18 @@
-import { createHmac, randomBytes } from 'node:crypto';
+import { createCipheriv, randomBytes } from 'node:crypto';
 
 const LABEL_BYTES = 16;
 const LABEL_BITS = LABEL_BYTES * 8;
+const KEY_VERSION = 3;
+const PRG_KIND = 'aes128-fixed-key-davies-meyer-v1';
+// Block128(high, low) in prg.cpp has little-endian low/high uint64 lanes.
+// This is a public PRG parameter, not a server secret or an encryption key
+// for database contents. Security assumes this fixed-key expansion is a PRG.
+const PRG_KEY = Buffer.alloc(LABEL_BYTES);
+PRG_KEY.writeBigUInt64LE(3602874713526624977n, 0);
+PRG_KEY.writeBigUInt64LE(2718281828459045235n, 8);
+// Byte zero's low bit belongs to the control output and is cleared in labels.
+// Use a remaining seed bit for binary value masking and deferred corrections.
+export const DPF_VALUE_BYTE = 1;
 
 function assertBits(bits, name, length) {
   if (!Array.isArray(bits) || bits.length !== length) throw new TypeError(`${name} must contain ${length} bits`);
@@ -14,15 +25,9 @@ function xorWordInto(target, source) {
   for (let i = 0; i < LABEL_BYTES; i++) target[i] ^= source[i];
 }
 
-function expandLabel(label, level) {
-  // A domain-separated PRG producing two 128-bit seeds and two separate
-  // control bits, as in the BGI construction. Never reuse a seed bit as a
-  // control bit: public seed corrections must not reveal control corrections.
-  const digest = createHmac('sha512', label)
-    .update('DUORAM-DPF-EXPAND-v2')
-    .update(Buffer.from([level]))
-    .digest();
-  return [Buffer.from(digest.subarray(0, LABEL_BYTES)), Buffer.from(digest.subarray(LABEL_BYTES, LABEL_BYTES * 2)), digest[32] & 1, digest[33] & 1];
+function expandLabel(label) {
+  const { children, childFlags } = expandLayer([label]);
+  return [children[0], children[1], childFlags[0], childFlags[1]];
 }
 
 function bitAt(word, bit) {
@@ -57,15 +62,33 @@ function advanceLayer(children, childFlags, flags, correction) {
   return nextFlags;
 }
 
-function expandLayer(labels, level) {
+function expandLayer(labels) {
   const children = new Array(labels.length * 2);
   const childFlags = new Uint8Array(children.length);
+  const inputs = Buffer.alloc(children.length * LABEL_BYTES);
   for (let node = 0; node < labels.length; node++) {
-    const [left, right, leftFlag, rightFlag] = expandLabel(labels[node], level);
-    children[node * 2] = left;
-    children[node * 2 + 1] = right;
-    childFlags[node * 2] = leftFlag;
-    childFlags[node * 2 + 1] = rightFlag;
+    const left = node * 2 * LABEL_BYTES, right = left + LABEL_BYTES;
+    labels[node].copy(inputs, left);
+    labels[node].copy(inputs, right);
+    inputs[left] &= 0xfe;
+    inputs[right] |= 1;
+  }
+  // Batch independent AES blocks into one OpenSSL call per tree layer.
+  // ECB here is a raw block-cipher primitive, not database encryption.
+  const cipher = createCipheriv('aes-128-ecb', PRG_KEY, null);
+  cipher.setAutoPadding(false);
+  const outputs = cipher.update(inputs);
+  if (cipher.final().length !== 0 || outputs.length !== inputs.length) {
+    throw new Error('Unexpected AES DPF expansion length');
+  }
+  for (let child = 0; child < children.length; child++) {
+    const offset = child * LABEL_BYTES;
+    const seed = Buffer.alloc(LABEL_BYTES);
+    // G_b(s) = AES_K(s with LSB=b) XOR (s with LSB=b), as in prg.cpp.
+    for (let byte = 0; byte < LABEL_BYTES; byte++) seed[byte] = outputs[offset + byte] ^ inputs[offset + byte];
+    childFlags[child] = seed[0] & 1;
+    seed[0] &= 0xfe;
+    children[child] = seed;
   }
   return { children, childFlags };
 }
@@ -94,13 +117,14 @@ export async function generateDuoramDpfShare({
   if (onEvaluation !== undefined && typeof onEvaluation !== 'function') throw new TypeError('onEvaluation must be a function');
 
   const root = randomBytes(LABEL_BYTES);
+  root[0] = (root[0] & 0xfe) | party;
   let labels = [root];
   let flags = Uint8Array.of(party);
   const corrections = [];
 
   for (let level = 0; level < domainBits; level++) {
     const targetShare = indexShareBits[domainBits - level - 1];
-    const { children, childFlags } = expandLayer(labels, level);
+    const { children, childFlags } = expandLayer(labels);
 
     const leftXor = Buffer.alloc(LABEL_BYTES), rightXor = Buffer.alloc(LABEL_BYTES);
     for (let child = 0; child < children.length; child += 2) {
@@ -141,7 +165,7 @@ export async function generateDuoramDpfShare({
   // Joint generation already visits and corrects every leaf. Preprocessing
   // may retain these local leaves instead of repeating all PRG expansions.
   if (onEvaluation) onEvaluation(leafEvaluation(labels, flags));
-  return { version: 2, kind: 'duoram-dpf', party, domainBits, root: root.toString('hex'), corrections };
+  return { version: KEY_VERSION, kind: 'duoram-dpf', prg: PRG_KIND, party, domainBits, root: root.toString('hex'), corrections };
 }
 
 function leafEvaluation(labels, flags) {
@@ -151,15 +175,16 @@ function leafEvaluation(labels, flags) {
 }
 
 function validateKey(key) {
-  if (!key || key.version !== 2 || key.kind !== 'duoram-dpf' ||
+  if (!key || key.version !== KEY_VERSION || key.kind !== 'duoram-dpf' || key.prg !== PRG_KIND ||
       (key.party !== 0 && key.party !== 1) || !Number.isInteger(key.domainBits) ||
       key.domainBits < 1 || key.domainBits > 20 || !Array.isArray(key.corrections) || key.corrections.length !== key.domainBits) {
     throw new TypeError('Malformed DUORAM DPF key share');
   }
   const root = decodeWord(key.root);
+  if ((root[0] & 1) !== key.party) throw new TypeError('Malformed AES DPF root control');
   for (const correction of key.corrections) {
     assertBits([correction?.left, correction?.right], 'DPF correction controls', 2);
-    decodeWord(correction?.word);
+    if ((decodeWord(correction?.word)[0] & 1) !== 0) throw new TypeError('DPF seed correction must exclude the control bit');
   }
   return root;
 }
@@ -175,7 +200,7 @@ export function evaluateDuoramDpfValues(key) {
   let labels = [validateKey(key)];
   let flags = Uint8Array.of(key.party);
   for (let level = 0; level < key.domainBits; level++) {
-    const { children, childFlags } = expandLayer(labels, level);
+    const { children, childFlags } = expandLayer(labels);
     flags = advanceLayer(children, childFlags, flags, key.corrections[level]);
     labels = children;
   }
@@ -188,7 +213,7 @@ export function evaluateDuoramDpfAt(key, index) {
   if (!Number.isSafeInteger(index) || index < 0 || index >= 2 ** key.domainBits) throw new RangeError('Index is outside the DPF domain');
   for (let level = 0; level < key.domainBits; level++) {
     const branch = (index >>> (key.domainBits - level - 1)) & 1;
-    const children = expandLabel(label, level);
+    const children = expandLabel(label);
     const correction = key.corrections[level];
     label = children[branch];
     const nextFlag = children[branch + 2] ^ (flag & (branch === 0 ? correction.left : correction.right));
