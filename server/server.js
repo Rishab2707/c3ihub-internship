@@ -6,7 +6,8 @@ import { answerInitiatorRound, completeResponderRound } from './crypto/and-round
 import { exchangeDpfControl } from './crypto/dpf-control-store.js';
 import { setupInThread, stopSetupThread, runInitiatorSetupInThread } from './crypto/ot-setup-thread.js';
 import { runSharedBitOperation } from './crypto/operation.js';
-import { beginPreprocessing, answerPreprocessingQuery, finishPreprocessingQuery, generatePreprocessedDpf, consumePreprocessing } from './crypto/preprocessing.js';
+import { beginPreprocessing, generatePreprocessedDpf, consumePreprocessing } from './crypto/preprocessing.js';
+import { requestHelper } from './crypto/dealer-client.js';
 import { exchangeRead } from './crypto/read-round-store.js';
 
 const role = process.argv[2];
@@ -24,7 +25,9 @@ const peerUrl = new URL(process.env.DUORAM_PEER_URL || `${defaultPeerScheme}://1
 const SIZE = Number(process.env.DB_SIZE || 2 ** 16);
 if (!Number.isSafeInteger(SIZE) || SIZE < 1 || SIZE > 1_000_000) throw new Error('DB_SIZE must be an integer from 1 to 1,000,000');
 const DOMAIN_BITS = Math.max(1, Math.ceil(Math.log2(SIZE)));
-const PROTOCOL_WIRE_VERSION = 'duoram-preprocessed-cspir-triples-aes-bit-v11';
+const PROTOCOL_WIRE_VERSION = 'duoram-three-party-blinded-aes-bit-v13';
+let preprocessingMode = process.env.DUORAM_PREPROCESSING_MODE || 'dealer';
+if (!['dealer', 'ot'].includes(preprocessingMode)) throw new Error('DUORAM_PREPROCESSING_MODE must be dealer or ot');
 const INSTANCE_ID = randomUUID();
 let peerInstanceId = null;
 const PEER_TOKEN = process.env.DUORAM_PEER_TOKEN || '';
@@ -66,11 +69,15 @@ function operationsEnabled() {
 
 function closeRuntimeGate(error) {
   protocolFault = true;
-  console.error(`Server ${role.toUpperCase()} stopped secure operations; restart both servers together: ${error.message}`);
+  console.error(`Server ${role.toUpperCase()} stopped secure operations; restart all three servers together: ${error.message}`);
 }
 
 // A hardcoded zero database. Each party initially owns a zero XOR share.
 const databaseShare = new Uint8Array(SIZE);
+// Public-zero initial state: blinded copies and helper blinds start at zero.
+const blindShare = new Uint8Array(SIZE);
+const peerBlindedShare = new Uint8Array(SIZE);
+let blindVersion = 0, helperInstanceId = null;
 const clientInputs = new Map();
 const backgroundOperations = new Map();
 const operationResults = new Map();
@@ -231,9 +238,29 @@ async function runPartyOperation(sessionId, operation, indexShareBits, valueShar
     indexShareBits,
     valueShare,
     databaseShare,
+    blindShare, peerBlindedShare, blindVersion,
     preprocessing,
     peerRequest: sendPeer,
+    helperRequest: sendHelper,
   });
+}
+
+async function sendHelper(path, payload) {
+  const result = await requestHelper(path, payload, role === 'a' ? 0 : 1, INSTANCE_ID);
+  if (helperInstanceId !== null && result.dealerInstance !== helperInstanceId) {
+    const error = new Error('Helper lifetime changed; restart all three servers');
+    closeRuntimeGate(error); throw error;
+  }
+  helperInstanceId = result.dealerInstance;
+  return result;
+}
+
+function commitLocalState(result) {
+  databaseShare.set(result.updatedDatabaseShare);
+  blindShare.set(result.updatedBlindShare);
+  peerBlindedShare.set(result.updatedPeerBlindedShare);
+  blindVersion++;
+  delete result.updatedDatabaseShare; delete result.updatedBlindShare; delete result.updatedPeerBlindedShare;
 }
 
 async function getInitiatorOtContexts() {
@@ -281,14 +308,18 @@ async function runCoordinatorOperation(sessionId, operation, indexShareBits, val
     }
     throw error;
   }
-  const result = await runPartyOperation(sessionId, operation, indexShareBits, valueShare, preprocessing);
-  await sendPeer('/internal/op/wait', { sessionId });
+  let result;
+  try {
+    result = await runPartyOperation(sessionId, operation, indexShareBits, valueShare, preprocessing);
+    await sendPeer('/internal/op/wait', { sessionId });
+  } catch (error) { closeRuntimeGate(error); throw error; }
   if (operation === 'insert') {
     // The peer endpoint is idempotent, so retry an ambiguous transport failure
     // before applying A's staged share.
     let commitError;
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
+        await sendHelper('/internal/commit', { id: sessionId });
         await sendPeer('/internal/op/commit', { sessionId });
         commitError = null;
         break;
@@ -304,8 +335,7 @@ async function runCoordinatorOperation(sessionId, operation, indexShareBits, val
       closeRuntimeGate(commitError);
       throw commitError;
     }
-    databaseShare.set(result.updatedDatabaseShare);
-    delete result.updatedDatabaseShare;
+    commitLocalState(result);
   }
   if (operationsEnabled()) void ensurePreprocessing().catch(() => {});
   return result;
@@ -320,23 +350,24 @@ async function ensurePreprocessing() {
         protocolVersion: PROTOCOL_WIRE_VERSION, databaseSize: SIZE, domainBits: DOMAIN_BITS,
       });
       if (peer.role !== 'b') throw new Error('Preprocessing requires server B');
-      const contexts = await getInitiatorOtContexts();
-      const item = beginPreprocessing(randomUUID(), 0, DOMAIN_BITS, contexts);
+      const contexts = preprocessingMode === 'ot' ? await getInitiatorOtContexts() : null;
+      const item = beginPreprocessing(randomUUID(), 0, DOMAIN_BITS, contexts, preprocessingMode);
       startedId = item.id;
-      const response = await sendPeer('/internal/preprocess/start', {
-        preprocessingId: item.id, request: item.receiver.message,
+      await sendPeer('/internal/preprocess/start', {
+        preprocessingId: item.id, mode: item.mode,
       });
-      const reply = answerPreprocessingQuery(item, response.request, contexts);
-      finishPreprocessingQuery(item, response.reply);
-      await sendPeer('/internal/preprocess/finish-query', { preprocessingId: item.id, reply });
-      await generatePreprocessedDpf(item, contexts, sendPeer);
-      await sendPeer('/internal/preprocess/wait', { preprocessingId: item.id });
+      await generatePreprocessedDpf(item, contexts, sendPeer, sendHelper, SIZE);
+      const completed = await sendPeer('/internal/preprocess/wait', { preprocessingId: item.id });
+      if (completed.mode !== item.mode || completed.helperInstance !== item.helperInstance) {
+        throw new Error('Preprocessing source changed during generation');
+      }
       preparedItem = item;
       preprocessingError = null;
       return item;
     })().catch(async error => {
       if (startedId && operationsEnabled()) {
         await sendPeer('/internal/preprocess/abort', { preprocessingId: startedId }).catch(() => {});
+        await sendHelper('/internal/discard', { id: startedId }).catch(() => {});
       }
       preprocessingError = 'Preprocessing failed; retry the operation or restart both servers';
       throw error;
@@ -379,12 +410,39 @@ const requestHandler = async (req, res) => {
         operationsEnabled: operationsEnabled(),
         restartRequired: protocolFault,
         securePeerTransport,
-        protocol: 'two-party DUORAM read with encrypted-download CSPIR and shifted offline DPF; research prototype',
+        protocol: 'three-party DUORAM blinded read and blind refresh; research prototype',
+        blindVersion,
         preprocessing: {
+          mode: preprocessingMode,
+          tripleProtocol: 'Du-Atallah',
           ready: role === 'a' ? Number(Boolean(preparedItem)) : [...responderPreprocessing.values()].filter(entry => entry.complete).length,
           pending: role === 'a' ? Boolean(preparationPromise) : [...responderPreprocessing.values()].some(entry => !entry.complete),
           error: role === 'a' ? preprocessingError : null,
         },
+      });
+    }
+
+    if (req.method === 'POST' && req.url === '/api/preprocessing/mode') {
+      if (role !== 'a' || !operationsEnabled()) return json(res, 501, { error: 'Mode changes require enabled server A' });
+      const { mode } = await parseBody(req);
+      if (!['dealer', 'ot'].includes(mode)) return json(res, 400, { error: 'Choose dealer or ot' });
+      // A mode is global to all clients. Serialize with reads/writes and finish
+      // outstanding preparation before discarding old-mode items on both peers.
+      return enqueueClientOperation(res, async () => {
+        if (!operationsEnabled()) return json(res, 503, { error: 'Restart the servers' });
+        if (preparationPromise) await preparationPromise.catch(() => {});
+        if (mode !== preprocessingMode) {
+          if (preparedItem) {
+            await sendPeer('/internal/preprocess/abort', { preprocessingId: preparedItem.id });
+            await sendHelper('/internal/discard', { id: preparedItem.id });
+            preparedItem = null;
+          }
+          await sendPeer('/internal/preprocess/mode', { mode });
+          preprocessingMode = mode;
+        }
+        preprocessingError = null;
+        void ensurePreprocessing().catch(() => {});
+        return json(res, 200, { mode: preprocessingMode });
       });
     }
 
@@ -510,38 +568,38 @@ const requestHandler = async (req, res) => {
         const id = body.preprocessingId;
         const now = Date.now();
         for (const [key, expires] of seenPreprocessing) if (expires <= now) seenPreprocessing.delete(key);
-        if (!validSessionId(id) || !responderOtContexts || responderPreprocessing.size >= 2 ||
+        if (!['dealer', 'ot'].includes(body.mode) || !validSessionId(id) || (body.mode === 'ot' && !responderOtContexts) || responderPreprocessing.size >= 2 ||
             responderPreprocessing.has(id) || seenPreprocessing.has(id) || seenPreprocessing.size >= MAX_SEEN_SESSIONS) {
           return json(res, 409, { error: 'Preprocessing unavailable or identifier already used' });
         }
         seenPreprocessing.set(id, now + SESSION_TOMBSTONE_TTL_MS);
-        const item = beginPreprocessing(id, 1, DOMAIN_BITS, responderOtContexts);
-        const request = item.receiver.message;
-        const reply = answerPreprocessingQuery(item, body.request, responderOtContexts);
+        preprocessingMode = body.mode;
+        const item = beginPreprocessing(id, 1, DOMAIN_BITS, responderOtContexts, body.mode);
         const entry = { item, complete: false };
         entry.timer = setTimeout(() => { responderPreprocessing.delete(id); }, SESSION_TOMBSTONE_TTL_MS);
         entry.timer.unref?.();
         responderPreprocessing.set(id, entry);
-        entry.task = generatePreprocessedDpf(item, responderOtContexts, sendPeer).catch(error => {
+        entry.task = generatePreprocessedDpf(item, responderOtContexts, sendPeer, sendHelper, SIZE).catch(error => {
           entry.error = error;
         });
-        return json(res, 200, { request, reply });
-      }
-      if (role === 'b' && req.url === '/internal/preprocess/finish-query') {
-        const entry = responderPreprocessing.get(body.preprocessingId);
-        if (!entry) return json(res, 409, { error: 'Unknown preprocessing item' });
-        finishPreprocessingQuery(entry.item, body.reply);
-        return json(res, 200, { ok: true });
+        return json(res, 200, { started: true });
       }
       if (role === 'b' && req.url === '/internal/preprocess/wait') {
         const entry = responderPreprocessing.get(body.preprocessingId);
         if (!entry) return json(res, 409, { error: 'Unknown preprocessing item' });
         await entry.task;
-        if (entry.error || entry.item.selectedPad === undefined) throw new Error('Preprocessing failed');
+        if (entry.error || !entry.item.helperInstance) throw new Error('Preprocessing failed');
         entry.complete = true;
         // A completed, bounded pool item may wait indefinitely for a client.
         clearTimeout(entry.timer);
-        return json(res, 200, { ready: true });
+        return json(res, 200, { ready: true, mode: entry.item.mode, helperInstance: entry.item.helperInstance });
+      }
+      if (role === 'b' && req.url === '/internal/preprocess/mode') {
+        if (!['dealer', 'ot'].includes(body.mode) || responderPreprocessing.size !== 0) {
+          return json(res, 409, { error: 'Discard existing preprocessing before switching mode' });
+        }
+        preprocessingMode = body.mode;
+        return json(res, 200, { mode: preprocessingMode });
       }
       if (role === 'b' && req.url === '/internal/preprocess/abort') {
         const entry = responderPreprocessing.get(body.preprocessingId);
@@ -560,11 +618,10 @@ const requestHandler = async (req, res) => {
         }
         if (backgroundOperations.size >= MAX_BACKGROUND_OPERATIONS) return json(res, 503, { error: 'Too many active operations' });
         const input = clientInputs.get(body.sessionId);
-        const contexts = responderOtContexts;
         const preprocessingEntry = responderPreprocessing.get(body.preprocessingId);
-        if (!input || Date.now() - input.createdAt > 5 * 60_000 || !contexts || backgroundOperations.has(body.sessionId)) {
+        if (!input || Date.now() - input.createdAt > 5 * 60_000 || backgroundOperations.has(body.sessionId)) {
           clientInputs.delete(body.sessionId);
-          return json(res, 409, { error: 'Operation inputs or OT setup are unavailable' });
+          return json(res, 409, { error: 'Operation inputs are unavailable' });
         }
         if (!preprocessingEntry?.complete) return json(res, 409, { error: 'Fresh completed preprocessing is unavailable' });
         const preprocessing = consumePreprocessing(preprocessingEntry.item);
@@ -576,7 +633,7 @@ const requestHandler = async (req, res) => {
             if (body.operation === 'insert') {
               if (stagedDatabaseShares.size >= MAX_BACKGROUND_OPERATIONS) throw new Error('Too many staged database updates');
               const staged = {
-                share: result.updatedDatabaseShare,
+                state: result,
                 result: { ok: true, validityShare: result.validityShare },
                 cleanupTimer: null,
               };
@@ -585,13 +642,13 @@ const requestHandler = async (req, res) => {
               }, COMPLETED_OPERATION_TTL_MS);
               staged.cleanupTimer.unref?.();
               stagedDatabaseShares.set(body.sessionId, staged);
-              delete result.updatedDatabaseShare;
             } else {
               rememberResult(body.sessionId, { share: result.share, validityShare: result.validityShare });
             }
             return { complete: true };
           })
           .catch(error => {
+            closeRuntimeGate(error);
             console.error(`MPC operation ${body.sessionId} failed:`, error.message);
             rememberResult(body.sessionId, { error: 'Secure operation failed' });
             return { error: 'Secure operation failed' };
@@ -622,7 +679,7 @@ const requestHandler = async (req, res) => {
         if (committedDatabaseUpdates.has(body.sessionId)) return json(res, 200, { committed: true });
         const staged = stagedDatabaseShares.get(body.sessionId);
         if (!staged) return json(res, 409, { error: 'No staged database update' });
-        databaseShare.set(staged.share);
+        commitLocalState(staged.state);
         clearTimeout(staged.cleanupTimer);
         stagedDatabaseShares.delete(body.sessionId);
         committedDatabaseUpdates.set(body.sessionId, now + COMPLETED_OPERATION_TTL_MS);

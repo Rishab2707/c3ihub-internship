@@ -9,7 +9,7 @@ function deferred() {
 }
 
 function entryFor(sessionId, phase) {
-  const validPhase = ['offset', 'response'].includes(phase) || /^triple:(?:[0-9]|1[0-9])$/.test(phase);
+  const validPhase = ['offset', 'update'].includes(phase) || /^triple:(?:[0-9]|1[0-9])$/.test(phase);
   if (typeof sessionId !== 'string' || !/^[0-9a-f-]{36}$/i.test(sessionId) || !validPhase) {
     throw new TypeError('Invalid read exchange identifier');
   }

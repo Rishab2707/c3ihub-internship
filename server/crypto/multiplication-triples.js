@@ -22,6 +22,13 @@ export async function generateOtTriplePool(count, otMultiply) {
     a.fill(0); b.fill(0);
     throw error;
   }
+  return createTriplePool(a, b, c);
+}
+
+export function createTriplePool(a, b, c) {
+  const count = a?.length;
+  if (!Number.isInteger(count) || count < 1 || count > 2560) throw new TypeError('Invalid triple batch');
+  assertBits(a, count); assertBits(b, count); assertBits(c, count);
   let cursor = 0;
   return {
     get remaining() { return count - cursor; },

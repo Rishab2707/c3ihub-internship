@@ -1,6 +1,3 @@
-import { randomBytes } from 'node:crypto';
-import { waitForDpfControl } from './dpf-control-store.js';
-import { bitsToIndex, encryptCspirResponse, decryptCspirResponse } from './cspir.js';
 import { waitForReadExchange } from './read-round-store.js';
 import { DPF_VALUE_BYTE } from './duoram-dpf.js';
 
@@ -13,79 +10,59 @@ export function shiftDpfEvaluation(evaluation, shift) {
   };
 }
 
-async function applyPointOperation({ operation, evaluation, valueShare, databaseShare, readShare, exchangeControlShares, domainBits }) {
-  if (operation !== 'access' && operation !== 'insert') throw new TypeError('Unsupported operation');
-  const pointShare = evaluation.flags;
-  // The XOR of the in-range point-function shares is a secret share of one
-  // exactly when the addressed point has a backing database cell. Returning
-  // this bit to the caller lets it reject padded-domain indices without
-  // opening or reconstructing the address at either server.
-  const validityShare = pointShare
-    .slice(0, databaseShare.length)
-    .reduce((valid, bit) => valid ^ bit, 0);
-  if (operation === 'access') {
-    return {
-      share: readShare,
-      validityShare,
-    };
-  }
-  // A replacement first reads a shared old bit and converts the requested
-  // new value into an XOR-shared delta. No party opens the old bit or delta.
-  const oldBitShare = readShare;
-  const correctionShare = Buffer.from(evaluation.finalCorrectionShare);
-  correctionShare[DPF_VALUE_BYTE] ^= oldBitShare ^ valueShare;
-  // The final exchange is separate from the d tree-level exchanges. This
-  // opens only the deferred DPF correction, as in corrected_update_vector
-  // in the C++ reference. It never opens the shared value or address.
-  const peer = await exchangeControlShares(domainBits, 0, 0, correctionShare.toString('hex'));
-  if (peer?.left !== 0 || peer?.right !== 0 || typeof peer.wordShare !== 'string' || !/^[0-9a-f]{32}$/.test(peer.wordShare)) {
-    throw new TypeError('Invalid deferred DPF correction contribution');
-  }
-  const peerWord = Buffer.from(peer.wordShare, 'hex');
-  for (let byte = 0; byte < correctionShare.length; byte++) correctionShare[byte] ^= peerWord[byte];
-  // Project a non-control seed bit of the reference's 128-bit value-DPF.
-  // Byte zero's low bit is cleared by AES expansion and cannot mask a delta.
-  // All public positions are traversed on both parties.
-  const updated = databaseShare.map((bit, index) => bit ^
-    (evaluation.values[index][DPF_VALUE_BYTE] & 1) ^ (pointShare[index] & (correctionShare[DPF_VALUE_BYTE] & 1)));
-  // Keep the share staged until the coordinator has confirmed that both
-  // parties completed the MPC operation. The server commits it afterward.
-  return { ok: true, validityShare, updatedDatabaseShare: updated };
-}
-
-export async function runSharedBitOperation({
-  party,
-  sessionId,
-  operation,
-  indexShareBits,
-  valueShare,
-  databaseShare,
-  preprocessing,
-  peerRequest,
-}) {
-  if (party !== 0 && party !== 1) throw new TypeError('party must be 0 or 1');
-  if (!preprocessing?.consumed || preprocessing.party !== party) throw new Error('Reserved preprocessing is required');
+export async function runSharedBitOperation({ party, sessionId, operation, indexShareBits, valueShare,
+  databaseShare, blindShare, peerBlindedShare, blindVersion, preprocessing, peerRequest, helperRequest }) {
+  if (party !== 0 && party !== 1) throw new TypeError('Invalid party');
+  if (!['access', 'insert'].includes(operation) || !preprocessing?.consumed || preprocessing.party !== party) throw new Error('Reserved preprocessing is required');
   const exchange = party === 0
     ? (phase, contribution) => peerRequest('/internal/read/exchange', { sessionId, phase, contribution })
     : (phase, contribution) => waitForReadExchange(sessionId, phase, contribution);
-  const ownIndexShare = bitsToIndex(indexShareBits);
-  const randomIndex = bitsToIndex(preprocessing.randomIndexBits);
-  const ownOffset = ownIndexShare ^ randomIndex;
+  const toIndex = bits => bits.reduce((value, bit, position) => value | (bit << position), 0);
+  const ownOffset = toIndex(indexShareBits) ^ toIndex(preprocessing.randomIndexBits);
   const { offset: peerOffset } = await exchange('offset', { offset: ownOffset });
   const domainSize = 2 ** preprocessing.domainBits;
-  if (!Number.isInteger(peerOffset) || peerOffset < 0 || peerOffset >= domainSize) throw new TypeError('Invalid read offset');
-  const evaluation = shiftDpfEvaluation(preprocessing.evaluation, ownOffset ^ peerOffset);
-  // XOR-domain adaptation of DUORAM section 5: the peer's random query
-  // selects D[alpha_own XOR alpha_peer] XOR ownMask, without opening alpha.
-  const ownMask = randomBytes(1)[0] & 1;
-  const ciphertext = encryptCspirResponse(databaseShare, preprocessing.pads, ownIndexShare ^ peerOffset, ownMask);
-  const peerResponse = await exchange('response', { ciphertext });
-  const maskedPeerBit = decryptCspirResponse(peerResponse.ciphertext, domainSize, randomIndex, preprocessing.selectedPad);
-  const readShare = maskedPeerBit ^ ownMask;
-  const exchangeControlShares = party === 0
-    ? (level, left, right, wordShare) => peerRequest('/internal/mpc/dpf/control', { sessionId, level, left, right, wordShare })
-    : (level, left, right, wordShare) => waitForDpfControl(sessionId, level, left, right, wordShare);
-  return applyPointOperation({ operation, evaluation, valueShare, databaseShare, readShare,
-    exchangeControlShares, domainBits: preprocessing.domainBits });
-}
+  if (!Number.isInteger(peerOffset) || peerOffset < 0 || peerOffset >= domainSize) throw new TypeError('Invalid offset');
+  const shift = ownOffset ^ peerOffset;
+  const components = preprocessing.components.map(evaluation => shiftDpfEvaluation(evaluation, shift));
+  const cancellation = await helperRequest('/internal/read', {
+    id: sessionId, preprocessingId: preprocessing.id, shift, operation, version: blindVersion,
+  });
+  if (![0, 1].includes(cancellation.gamma) || cancellation.version !== blindVersion) throw new Error('Invalid helper cancellation');
+  const readFlags = components[0].flags;
+  const otherBlindFlags = components[party === 0 ? 2 : 1].flags;
+  let readShare = cancellation.gamma, validityShare = 0;
+  for (let i = 0; i < databaseShare.length; i++) {
+    readShare ^= ((databaseShare[i] ^ peerBlindedShare[i]) & readFlags[i]) ^
+      (blindShare[i] & (otherBlindFlags[i] ^ readFlags[i]));
+    validityShare ^= readFlags[i];
+  }
+  if (operation === 'access') return { share: readShare, validityShare };
 
+  const correctionShares = components.map(evaluation => {
+    const word = Buffer.from(evaluation.finalCorrectionShare);
+    word[DPF_VALUE_BYTE] ^= readShare ^ valueShare;
+    return word.toString('hex');
+  });
+  const peer = await exchange('update', { correctionShares });
+  if (!Array.isArray(peer?.correctionShares) || peer.correctionShares.length !== 3 ||
+      peer.correctionShares.some(word => typeof word !== 'string' || !/^[0-9a-f]{32}$/.test(word))) throw new Error('Invalid value corrections');
+  const corrections = correctionShares.map((encoded, c) => {
+    const word = Buffer.from(encoded, 'hex'), other = Buffer.from(peer.correctionShares[c], 'hex');
+    for (let byte = 0; byte < 16; byte++) word[byte] ^= other[byte];
+    return word;
+  });
+  const deltas = components.map((evaluation, c) => databaseShare.map((_, i) =>
+    (evaluation.values[i][DPF_VALUE_BYTE] & 1) ^ (evaluation.flags[i] & (corrections[c][DPF_VALUE_BYTE] & 1))));
+  const ownBlindComponent = party === 0 ? 1 : 2;
+  const peerBlindComponent = party === 0 ? 2 : 1;
+  const staged = await helperRequest('/internal/stage-update', {
+    id: sessionId, finalBlinds: corrections.slice(1).map(word => word.toString('hex')),
+  });
+  if (!staged.staged) throw new Error('Helper blind refresh was not staged');
+  return {
+    ok: true, validityShare,
+    updatedDatabaseShare: databaseShare.map((bit, i) => bit ^ deltas[0][i]),
+    updatedBlindShare: blindShare.map((bit, i) => bit ^ deltas[ownBlindComponent][i]),
+    updatedPeerBlindedShare: peerBlindedShare.map((bit, i) => bit ^ deltas[0][i] ^ deltas[peerBlindComponent][i]),
+  };
+}

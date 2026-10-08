@@ -51,6 +51,9 @@ function App() {
   const [status, setStatus] = useState('Checking servers…');
   const [result, setResult] = useState(null);
   const [busy, setBusy] = useState(false);
+  const [preprocessingMode, setPreprocessingMode] = useState('dealer');
+  const [canSwitch, setCanSwitch] = useState(false);
+  const [switching, setSwitching] = useState(false);
 
   useEffect(() => {
     const transportError = endpointTransportError(A) || endpointTransportError(B);
@@ -69,17 +72,34 @@ function App() {
         const ready = paired && a.operationsEnabled && b.operationsEnabled;
         setDatabaseSize(a.size);
         setDomainBits(a.domainBits);
+        setPreprocessingMode(a.preprocessing?.mode || 'dealer');
+        setCanSwitch(ready);
         setEnabled(ready && a.preprocessing?.ready > 0);
         setStatus(!paired ? 'Configure one server A endpoint and one server B endpoint with matching database sizes' :
-          ready ? `Both servers ready · ${a.size.toLocaleString()} bits · ${a.preprocessing?.ready ? 'Next access prepared' : 'Preparing next access'}` :
-            a.restartRequired || b.restartRequired ? 'Restart both servers together' : 'Protocol validation gate is closed');
+          ready ? (a.preprocessing?.error || `Both servers ready · ${a.size.toLocaleString()} bits · ${a.preprocessing?.ready ? 'Next access prepared' : 'Preparing next access'}`) :
+            a.restartRequired || b.restartRequired ? 'Restart both database servers and the helper together' : 'Protocol validation gate is closed');
       })
-      .catch(() => { if (active) { setEnabled(false); setStatus('Start both backend servers to connect'); } })
+      .catch(() => { if (active) { setEnabled(false); setCanSwitch(false); setStatus('Start both backend servers to connect'); } })
       .finally(() => { if (active) timer = setTimeout(refresh, 2000); });
     }
     refresh();
     return () => { active = false; clearTimeout(timer); };
   }, []);
+
+  async function switchPreprocessing() {
+    setSwitching(true);
+    setEnabled(false);
+    setResult(null);
+    try {
+      const next = preprocessingMode === 'dealer' ? 'ot' : 'dealer';
+      const response = await request(`${A}/api/preprocessing/mode`, 'POST', { mode: next });
+      setPreprocessingMode(response.mode);
+    } catch (error) {
+      setResult({ error: error.message });
+    } finally {
+      setSwitching(false);
+    }
+  }
 
   async function readServerShare(sessionId, resultToken) {
     const until = Date.now() + 120_000;
@@ -139,12 +159,18 @@ function App() {
   }
 
   return <main className="shell">
-    <header><div className="eyebrow">DUORAM · TWO SERVER PROTOTYPE</div><h1>Oblivious bit store</h1><p className="intro">The browser splits each index into XOR shares and sends one share to each server.</p></header>
+    <header><div className="eyebrow">DUORAM · THREE PARTY BLINDED READS</div><h1>Oblivious bit store</h1><p className="intro">The browser splits each index into XOR shares and sends one share to each database server.</p></header>
     <section className="card">
       <div className="status"><span className={enabled ? 'dot online' : 'dot'} />{status}</div>
+      <div className="preprocessing-mode">
+        <button className="secondary" aria-pressed={preprocessingMode === 'ot'} disabled={!canSwitch || busy || switching} onClick={switchPreprocessing}>
+          {switching ? 'Switching DPF preprocessing...' : `DPF preprocessing: ${preprocessingMode === 'dealer' ? 'Third-party triples' : 'OT based triples'}`}
+        </button>
+        <p className="note">Click to use {preprocessingMode === 'dealer' ? 'OT based triples' : 'third-party triples'} for DPF generation. The helper participates in blinded reads in both modes. Switching applies to all clients and preserves stored values.</p>
+      </div>
       <label>Database index <span>0–{(databaseSize - 1).toLocaleString()}</span><input type="number" min="0" max={databaseSize - 1} value={index} onChange={event => setIndex(event.target.value)} /></label>
       <label>Bit value <span>0 or 1 · used for insert</span><select value={value} onChange={event => setValue(event.target.value)}><option value="0">0</option><option value="1">1</option></select></label>
-      <div className="actions"><button disabled={!enabled || busy} onClick={() => run('access')}>{busy ? 'Working…' : 'Access bit'}</button><button className="secondary" disabled={!enabled || busy} onClick={() => run('insert')}>Insert / replace</button></div>
+      <div className="actions"><button disabled={!enabled || busy || switching} onClick={() => run('access')}>{busy ? 'Working…' : 'Access bit'}</button><button className="secondary" disabled={!enabled || busy || switching} onClick={() => run('insert')}>Insert / replace</button></div>
       {result && <div className={`result ${result.error ? 'error' : ''}`}>{result.error || <><strong>{result.operation} complete</strong><span>Index {result.index} contains bit <b>{result.value}</b></span></>}</div>}
     </section>
   </main>;
