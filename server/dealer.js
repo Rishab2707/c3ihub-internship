@@ -3,6 +3,7 @@ import https from 'node:https';
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { createHelperState } from './crypto/helper-state.js';
+import { DEFAULT_DB_SIZE } from '../shared/block-format.js';
 
 const tokens = [process.env.DUORAM_DEALER_TOKEN_A, process.env.DUORAM_DEALER_TOKEN_B];
 if (tokens.some(token => !/^[0-9a-f]{64}$/i.test(token || '')) || tokens[0] === tokens[1]) {
@@ -17,8 +18,8 @@ const tls = paths.every(Boolean) ? { key: readFileSync(paths[0]), cert: readFile
 if (!['localhost', '127.0.0.1', '::1'].includes(host) && !tls) throw new Error('Remote dealer listeners require TLS');
 const dealerInstance = randomUUID();
 const clients = [null, null];
-const size = Number(process.env.DB_SIZE || 2 ** 16);
-if (!Number.isSafeInteger(size) || size < 1 || size > 1_000_000) throw new Error('Invalid helper database size');
+const size = Number(process.env.DB_SIZE || DEFAULT_DB_SIZE);
+if (!Number.isSafeInteger(size) || size < 2 || size > 16384 || (size & (size - 1)) !== 0) throw new Error('DB_SIZE must be a power of two from 2 to 16384');
 const handleHelper = createHelperState(size);
 const batches = new Map();
 const seen = new Set();

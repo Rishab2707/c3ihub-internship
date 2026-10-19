@@ -21,7 +21,7 @@ const common = {
   DUORAM_ALLOWED_ORIGINS: `http://127.0.0.1:${clientPort},http://localhost:${clientPort}`,
 };
 console.log('Local demo: two database servers and an online blinding helper on loopback HTTP.');
-console.log(`Open http://127.0.0.1:${clientPort}; select third-party or OT triples for DPF generation.`);
+console.log(`Open http://127.0.0.1:${clientPort}; select third-party or OT triples for DPF generation and write-once checks.`);
 const children = [];
 let stopping = false;
 function stop(code) {

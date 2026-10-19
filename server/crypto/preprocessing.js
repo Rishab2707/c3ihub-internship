@@ -4,6 +4,7 @@ import { createOnlineAndCallback } from './online-and.js';
 import { waitForDpfControl } from './dpf-control-store.js';
 import { waitForReadExchange } from './read-round-store.js';
 import { dealerTriplePool, createDuAtallahAndCallback, generateOtDuAtallahTriplePool } from './du-atallah.js';
+import { BLOCK_BITS } from '../../shared/block-format.js';
 
 export function componentId(id, component) {
   const bytes = createHash('sha256').update(`DUORAM-COMPONENT-v13:${id}:${component}`).digest().subarray(0, 16);
@@ -48,6 +49,17 @@ export async function generatePreprocessedDpf(item, contexts, peerRequest, helpe
       if (pool.remaining !== 0) throw new Error('Incomplete triple consumption');
     } finally { pool.discard(); }
   }
+  // Reserve a separate, single-use batch for the secret write-once check.
+  // Reads discard this batch without opening anything.
+  const writeId = componentId(item.id, 3);
+  if (item.mode === 'dealer') {
+    const batch = await helperRequest('/internal/triples', { id: writeId, count: BLOCK_BITS });
+    item.writePool = dealerTriplePool(batch.shares, BLOCK_BITS);
+  } else {
+    const otMultiply = createOnlineAndCallback({ party: item.party, sessionId: writeId,
+      senderContext: contexts.senderContext, receiverSeedPairs: contexts.receiverSeedPairs, peerRequest });
+    item.writePool = await generateOtDuAtallahTriplePool(BLOCK_BITS, otMultiply);
+  }
   const registered = await helperRequest('/internal/preprocess', {
     id: item.id, key: item.helperKey, databaseSize, domainBits: item.domainBits,
   });
@@ -56,7 +68,7 @@ export async function generatePreprocessedDpf(item, contexts, peerRequest, helpe
 }
 
 export function consumePreprocessing(item) {
-  if (!item || item.consumed || item.components.length !== 3 || !item.helperInstance) {
+  if (!item || item.consumed || item.components.length !== 3 || !item.helperInstance || !item.writePool) {
     throw new Error('Fresh completed preprocessing is required');
   }
   item.consumed = true;

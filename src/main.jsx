@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import './style.css';
+import { BLOCK_BITS, BLOCK_BYTES, DEFAULT_DB_SIZE, MAX_TEXT_BYTES, encodeTextBlock, decodeTextBlock, blockFromHex, blockToHex } from '../shared/block-format.js';
 
 const A = import.meta.env.VITE_DUORAM_SERVER_A || 'http://127.0.0.1:4101';
 const B = import.meta.env.VITE_DUORAM_SERVER_B || 'http://127.0.0.1:4102';
@@ -39,14 +40,17 @@ function xorShareBits(index, width) {
   return [share0, share1];
 }
 
-function randomBit() { return crypto.getRandomValues(new Uint8Array(1))[0] & 1; }
+function shareBlock(block) {
+  const a = crypto.getRandomValues(new Uint8Array(BLOCK_BYTES));
+  return [blockToHex(a), blockToHex(block.map((byte, i) => byte ^ a[i]))];
+}
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 function App() {
   const [index, setIndex] = useState('0');
-  const [value, setValue] = useState('1');
-  const [databaseSize, setDatabaseSize] = useState(2 ** 16);
-  const [domainBits, setDomainBits] = useState(16);
+  const [value, setValue] = useState('');
+  const [databaseSize, setDatabaseSize] = useState(DEFAULT_DB_SIZE);
+  const [domainBits, setDomainBits] = useState(Math.log2(DEFAULT_DB_SIZE));
   const [enabled, setEnabled] = useState(false);
   const [status, setStatus] = useState('Checking servers…');
   const [result, setResult] = useState(null);
@@ -68,7 +72,7 @@ function App() {
       Promise.all([request(`${A}/api/status`), request(`${B}/api/status`)])
       .then(([a, b]) => {
         if (!active) return;
-        const paired = a.role === 'a' && b.role === 'b' && a.size === b.size && a.domainBits === b.domainBits;
+        const paired = a.role === 'a' && b.role === 'b' && a.size === b.size && a.domainBits === b.domainBits && a.blockBytes === BLOCK_BYTES && b.blockBytes === BLOCK_BYTES;
         const ready = paired && a.operationsEnabled && b.operationsEnabled;
         setDatabaseSize(a.size);
         setDomainBits(a.domainBits);
@@ -76,7 +80,7 @@ function App() {
         setCanSwitch(ready);
         setEnabled(ready && a.preprocessing?.ready > 0);
         setStatus(!paired ? 'Configure one server A endpoint and one server B endpoint with matching database sizes' :
-          ready ? (a.preprocessing?.error || `Both servers ready · ${a.size.toLocaleString()} bits · ${a.preprocessing?.ready ? 'Next access prepared' : 'Preparing next access'}`) :
+          ready ? (a.preprocessing?.error || `Both servers ready · ${a.size.toLocaleString()} blocks of ${BLOCK_BITS} bits · ${a.preprocessing?.ready ? 'Next access prepared' : 'Preparing next access'}`) :
             a.restartRequired || b.restartRequired ? 'Restart both database servers and the helper together' : 'Protocol validation gate is closed');
       })
       .catch(() => { if (active) { setEnabled(false); setCanSwitch(false); setStatus('Start both backend servers to connect'); } })
@@ -114,14 +118,15 @@ function App() {
   async function run(operation) {
     setResult(null);
     const requestedIndex = Number(index);
-    const requestedValue = Number(value);
+    const requestedValue = value;
     if (!Number.isInteger(requestedIndex) || requestedIndex < 0 || requestedIndex >= databaseSize) {
       setResult({ error: `Enter an index from 0 to ${databaseSize - 1}.` });
       return;
     }
-    if (operation === 'insert' && ![0, 1].includes(requestedValue)) {
-      setResult({ error: 'Inserted value must be 0 or 1.' });
-      return;
+    let encoded;
+    if (operation === 'insert') {
+      try { encoded = encodeTextBlock(requestedValue); }
+      catch (error) { setResult({ error: error.message }); return; }
     }
 
     setBusy(true);
@@ -130,8 +135,7 @@ function App() {
       const resultToken = Array.from(crypto.getRandomValues(new Uint8Array(32)),
         byte => byte.toString(16).padStart(2, '0')).join('');
       const [indexShareA, indexShareB] = xorShareBits(requestedIndex, domainBits);
-      const valueShareA = operation === 'insert' ? randomBit() : 0;
-      const valueShareB = operation === 'insert' ? requestedValue ^ valueShareA : 0;
+      const [valueShareA, valueShareB] = shareBlock(encoded || new Uint8Array(BLOCK_BYTES));
       await request(`${B}/api/share`, 'POST', { sessionId, indexShareBits: indexShareB, valueShare: valueShareB, resultToken });
       const data = await request(`${A}/api/${operation}`, 'POST', {
         sessionId,
@@ -143,13 +147,19 @@ function App() {
         if ((data.validityShare ^ secondShare.validityShare) !== 1) {
           throw new Error('The shared index is outside the database.');
         }
-        setResult({ operation: 'Access', index: requestedIndex, value: data.share ^ secondShare.share });
+        const first = blockFromHex(data.share), second = blockFromHex(secondShare.share);
+        const decoded = decodeTextBlock(first.map((byte, i) => byte ^ second[i]));
+        setResult({ operation: 'Read', index: requestedIndex, value: decoded.text, empty: !decoded.occupied });
       } else {
         const secondShare = await readServerShare(sessionId, resultToken);
         if ((data.validityShare ^ secondShare.validityShare) !== 1) {
           throw new Error('The shared index is outside the database.');
         }
-        setResult({ operation: 'Insert', index: requestedIndex, value: requestedValue });
+        if ((data.acceptedShare ^ secondShare.acceptedShare) !== 1) {
+          throw new Error('This slot is already occupied. Its original text was preserved.');
+        }
+        setResult({ operation: 'Write', index: requestedIndex, value: requestedValue, empty: false });
+        setValue('');
       }
     } catch (error) {
       setResult({ error: error.message });
@@ -159,19 +169,19 @@ function App() {
   }
 
   return <main className="shell">
-    <header><div className="eyebrow">DUORAM · THREE PARTY BLINDED READS</div><h1>Oblivious bit store</h1><p className="intro">The browser splits each index into XOR shares and sends one share to each database server.</p></header>
+    <header><div className="eyebrow">DUORAM · THREE PARTY BLINDED READS</div><h1>Oblivious text store</h1><p className="intro">Read or post ASCII text at a private index. Each slot accepts one post; its contents cannot be replaced.</p></header>
     <section className="card">
       <div className="status"><span className={enabled ? 'dot online' : 'dot'} />{status}</div>
       <div className="preprocessing-mode">
         <button className="secondary" aria-pressed={preprocessingMode === 'ot'} disabled={!canSwitch || busy || switching} onClick={switchPreprocessing}>
           {switching ? 'Switching DPF preprocessing...' : `DPF preprocessing: ${preprocessingMode === 'dealer' ? 'Third-party triples' : 'OT based triples'}`}
         </button>
-        <p className="note">Click to use {preprocessingMode === 'dealer' ? 'OT based triples' : 'third-party triples'} for DPF generation. The helper participates in blinded reads in both modes. Switching applies to all clients and preserves stored values.</p>
+        <p className="note">Click to use {preprocessingMode === 'dealer' ? 'OT based triples' : 'third-party triples'} for DPF generation and the write-once check. The helper participates in blinded reads in both modes. Switching applies to all clients and preserves stored values.</p>
       </div>
       <label>Database index <span>0–{(databaseSize - 1).toLocaleString()}</span><input type="number" min="0" max={databaseSize - 1} value={index} onChange={event => setIndex(event.target.value)} /></label>
-      <label>Bit value <span>0 or 1 · used for insert</span><select value={value} onChange={event => setValue(event.target.value)}><option value="0">0</option><option value="1">1</option></select></label>
-      <div className="actions"><button disabled={!enabled || busy || switching} onClick={() => run('access')}>{busy ? 'Working…' : 'Access bit'}</button><button className="secondary" disabled={!enabled || busy || switching} onClick={() => run('insert')}>Insert / replace</button></div>
-      {result && <div className={`result ${result.error ? 'error' : ''}`}>{result.error || <><strong>{result.operation} complete</strong><span>Index {result.index} contains bit <b>{result.value}</b></span></>}</div>}
+      <label>Post text <span>{value.length}/{MAX_TEXT_BYTES} ASCII characters</span><textarea rows="4" maxLength={MAX_TEXT_BYTES} value={value} onChange={event => setValue(event.target.value)} placeholder="Write a short post..." /></label>
+      <div className="actions"><button disabled={!enabled || busy || switching} onClick={() => run('access')}>{busy ? 'Working…' : 'Read text'}</button><button className="secondary" disabled={!enabled || busy || switching} onClick={() => run('insert')}>Write once</button></div>
+      {result && <div className={`result ${result.error ? 'error' : ''}`}>{result.error || <><strong>{result.operation} complete</strong><div className="post-result">Slot {result.index}: {result.empty ? 'empty (never written)' : <pre className="post-text">{result.value || '(empty string)'}</pre>}</div></>}</div>}
     </section>
   </main>;
 }

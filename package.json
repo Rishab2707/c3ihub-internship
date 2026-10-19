@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "demo": "node scripts/demo.js",
-    "dev": "concurrently \"npm:server:a\" \"npm:server:b\" \"npm:client\"",
+    "dev": "concurrently \"npm:dealer\" \"npm:server:a\" \"npm:server:b\" \"npm:client\"",
+    "dealer": "node server/dealer.js",
     "server:a": "node server/server.js a",
     "server:b": "node server/server.js b",
     "client": "vite --host 0.0.0.0",

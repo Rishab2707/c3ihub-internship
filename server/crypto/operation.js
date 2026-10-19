@@ -1,5 +1,6 @@
 import { waitForReadExchange } from './read-round-store.js';
-import { DPF_VALUE_BYTE } from './duoram-dpf.js';
+import { createDuAtallahAndCallback } from './du-atallah.js';
+import { BLOCK_BYTES, BLOCK_BITS, isBlockHex } from '../../shared/block-format.js';
 
 export function shiftDpfEvaluation(evaluation, shift) {
   if (!Number.isInteger(shift) || shift < 0 || shift >= evaluation.flags.length) throw new TypeError('Invalid DPF shift');
@@ -10,7 +11,7 @@ export function shiftDpfEvaluation(evaluation, shift) {
   };
 }
 
-export async function runSharedBitOperation({ party, sessionId, operation, indexShareBits, valueShare,
+export async function runSharedBlockOperation({ party, sessionId, operation, indexShareBits, valueShare,
   databaseShare, blindShare, peerBlindedShare, blindVersion, preprocessing, peerRequest, helperRequest }) {
   if (party !== 0 && party !== 1) throw new TypeError('Invalid party');
   if (!['access', 'insert'].includes(operation) || !preprocessing?.consumed || preprocessing.party !== party) throw new Error('Reserved preprocessing is required');
@@ -27,32 +28,66 @@ export async function runSharedBitOperation({ party, sessionId, operation, index
   const cancellation = await helperRequest('/internal/read', {
     id: sessionId, preprocessingId: preprocessing.id, shift, operation, version: blindVersion,
   });
-  if (![0, 1].includes(cancellation.gamma) || cancellation.version !== blindVersion) throw new Error('Invalid helper cancellation');
+  if (!isBlockHex(cancellation.gamma) || cancellation.version !== blindVersion) throw new Error('Invalid helper cancellation');
   const readFlags = components[0].flags;
   const otherBlindFlags = components[party === 0 ? 2 : 1].flags;
-  let readShare = cancellation.gamma, validityShare = 0;
-  for (let i = 0; i < databaseShare.length; i++) {
-    readShare ^= ((databaseShare[i] ^ peerBlindedShare[i]) & readFlags[i]) ^
-      (blindShare[i] & (otherBlindFlags[i] ^ readFlags[i]));
+  const readShare = Buffer.from(cancellation.gamma, 'hex');
+  const size = databaseShare.length / BLOCK_BYTES;
+  let validityShare = 0;
+  for (let i = 0; i < size; i++) {
+    const readMask = -readFlags[i], blindMask = -(otherBlindFlags[i] ^ readFlags[i]);
+    for (let byte = 0; byte < BLOCK_BYTES; byte++) {
+      const offset = i * BLOCK_BYTES + byte;
+      readShare[byte] ^= ((databaseShare[offset] ^ peerBlindedShare[offset]) & readMask) ^
+        (blindShare[offset] & blindMask);
+    }
     validityShare ^= readFlags[i];
   }
-  if (operation === 'access') return { share: readShare, validityShare };
+  if (operation === 'access') {
+    preprocessing.writePool.discard();
+    return { share: readShare.toString('hex'), validityShare };
+  }
+
+  // Secret conditional update: delta = (NOT occupied) AND (old XOR requested).
+  // Keep occupancy hidden from A, B and the helper. No public rejection branch.
+  const acceptedShare = (readShare[0] & 1) ^ Number(party === 0);
+  const requested = Buffer.from(valueShare, 'hex');
+  // Canonical occupied marker is enforced independently of the supplied shares.
+  requested[0] = Number(party === 0);
+  const operand = Array.from({ length: BLOCK_BITS }, (_, bit) =>
+    ((readShare[bit >> 3] ^ requested[bit >> 3]) >> (bit & 7)) & 1);
+  const andShares = createDuAtallahAndCallback({
+    pool: preprocessing.writePool,
+    exchangeOpenings: (_round, shares) => exchange('write-gate', shares),
+  });
+  const delta = Buffer.alloc(BLOCK_BYTES);
+  try {
+    const product = await andShares(Array(BLOCK_BITS).fill(acceptedShare), operand);
+    for (let bit = 0; bit < BLOCK_BITS; bit++) delta[bit >> 3] |= product[bit] << (bit & 7);
+    product.fill(0);
+  } finally { preprocessing.writePool.discard(); operand.fill(0); requested.fill(0); }
 
   const correctionShares = components.map(evaluation => {
     const word = Buffer.from(evaluation.finalCorrectionShare);
-    word[DPF_VALUE_BYTE] ^= readShare ^ valueShare;
+    for (let byte = 0; byte < BLOCK_BYTES; byte++) word[byte] ^= delta[byte];
     return word.toString('hex');
   });
+  delta.fill(0);
   const peer = await exchange('update', { correctionShares });
   if (!Array.isArray(peer?.correctionShares) || peer.correctionShares.length !== 3 ||
-      peer.correctionShares.some(word => typeof word !== 'string' || !/^[0-9a-f]{32}$/.test(word))) throw new Error('Invalid value corrections');
+      !peer.correctionShares.every(isBlockHex)) throw new Error('Invalid value corrections');
   const corrections = correctionShares.map((encoded, c) => {
     const word = Buffer.from(encoded, 'hex'), other = Buffer.from(peer.correctionShares[c], 'hex');
-    for (let byte = 0; byte < 16; byte++) word[byte] ^= other[byte];
+    for (let byte = 0; byte < BLOCK_BYTES; byte++) word[byte] ^= other[byte];
     return word;
   });
-  const deltas = components.map((evaluation, c) => databaseShare.map((_, i) =>
-    (evaluation.values[i][DPF_VALUE_BYTE] & 1) ^ (evaluation.flags[i] & (corrections[c][DPF_VALUE_BYTE] & 1))));
+  const deltas = components.map((evaluation, c) => {
+    const result = new Uint8Array(databaseShare.length);
+    for (let i = 0; i < size; i++) for (let byte = 0; byte < BLOCK_BYTES; byte++) {
+      result[i * BLOCK_BYTES + byte] = evaluation.values[i][byte] ^ (-evaluation.flags[i] & corrections[c][byte]);
+    }
+    return result;
+  });
   const ownBlindComponent = party === 0 ? 1 : 2;
   const peerBlindComponent = party === 0 ? 2 : 1;
   const staged = await helperRequest('/internal/stage-update', {
@@ -60,9 +95,9 @@ export async function runSharedBitOperation({ party, sessionId, operation, index
   });
   if (!staged.staged) throw new Error('Helper blind refresh was not staged');
   return {
-    ok: true, validityShare,
-    updatedDatabaseShare: databaseShare.map((bit, i) => bit ^ deltas[0][i]),
-    updatedBlindShare: blindShare.map((bit, i) => bit ^ deltas[ownBlindComponent][i]),
-    updatedPeerBlindedShare: peerBlindedShare.map((bit, i) => bit ^ deltas[0][i] ^ deltas[peerBlindComponent][i]),
+    ok: true, validityShare, acceptedShare,
+    updatedDatabaseShare: databaseShare.map((byte, i) => byte ^ deltas[0][i]),
+    updatedBlindShare: blindShare.map((byte, i) => byte ^ deltas[ownBlindComponent][i]),
+    updatedPeerBlindedShare: peerBlindedShare.map((byte, i) => byte ^ deltas[0][i] ^ deltas[peerBlindComponent][i]),
   };
 }

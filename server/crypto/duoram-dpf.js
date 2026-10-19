@@ -1,8 +1,9 @@
 import { createCipheriv, randomBytes } from 'node:crypto';
+import { BLOCK_BYTES } from '../../shared/block-format.js';
 
 const LABEL_BYTES = 16;
 const LABEL_BITS = LABEL_BYTES * 8;
-const KEY_VERSION = 3;
+const KEY_VERSION = 4;
 const PRG_KIND = 'aes128-fixed-key-davies-meyer-v1';
 // Block128(high, low) in prg.cpp has little-endian low/high uint64 lanes.
 // This is a public PRG parameter, not a server secret or an encryption key
@@ -10,9 +11,8 @@ const PRG_KIND = 'aes128-fixed-key-davies-meyer-v1';
 const PRG_KEY = Buffer.alloc(LABEL_BYTES);
 PRG_KEY.writeBigUInt64LE(3602874713526624977n, 0);
 PRG_KEY.writeBigUInt64LE(2718281828459045235n, 8);
-// Byte zero's low bit belongs to the control output and is cleared in labels.
-// Use a remaining seed bit for binary value masking and deferred corrections.
-export const DPF_VALUE_BYTE = 1;
+// Byte zero's low bit belongs to the control output and is cleared in tree labels.
+// Final block values are produced separately by expandLeaf().
 
 function assertBits(bits, name, length) {
   if (!Array.isArray(bits) || bits.length !== length) throw new TypeError(`${name} must contain ${length} bits`);
@@ -168,10 +168,22 @@ export async function generateDuoramDpfShare({
   return { version: KEY_VERSION, kind: 'duoram-dpf', prg: PRG_KIND, party, domainBits, root: root.toString('hex'), corrections };
 }
 
+// Output conversion is separate from the tree PRG. Equal off-target seeds
+// expand identically; only the target's expanded values need a correction.
+// A leaf seed is the AES key; the public IV separates this use from tree PRGs.
+export function expandLeaf(seed) {
+  if (!Buffer.isBuffer(seed) || seed.length !== LABEL_BYTES) throw new TypeError('Expected a 128-bit leaf seed');
+  const iv = Buffer.alloc(16);
+  iv.write('DUORAM-LEAF-v14');
+  const cipher = createCipheriv('aes-128-ctr', seed, iv);
+  return Buffer.concat([cipher.update(Buffer.alloc(BLOCK_BYTES)), cipher.final()]);
+}
+
 function leafEvaluation(labels, flags) {
-  const finalCorrectionShare = Buffer.alloc(LABEL_BYTES);
-  for (const label of labels) xorWordInto(finalCorrectionShare, label);
-  return { flags, values: labels, finalCorrectionShare };
+  const finalCorrectionShare = Buffer.alloc(BLOCK_BYTES);
+  const values = labels.map(expandLeaf);
+  for (const value of values) for (let byte = 0; byte < BLOCK_BYTES; byte++) finalCorrectionShare[byte] ^= value[byte];
+  return { flags, values, finalCorrectionShare };
 }
 
 function validateKey(key) {

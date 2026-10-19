@@ -1,13 +1,13 @@
 import { randomBytes } from 'node:crypto';
-import { evaluateDuoramDpfValues, DPF_VALUE_BYTE } from './duoram-dpf.js';
+import { evaluateDuoramDpfValues } from './duoram-dpf.js';
+import { BLOCK_BYTES, isBlockHex } from '../../shared/block-format.js';
 
 export function createHelperState(size) {
   const domainBits = Math.max(1, Math.ceil(Math.log2(size)));
-  const blinds = [new Uint8Array(size), new Uint8Array(size)];
+  const blinds = [new Uint8Array(size * BLOCK_BYTES), new Uint8Array(size * BLOCK_BYTES)];
   let version = 0, activeUpdate = null;
   const prepared = new Map(), usedPreprocessing = new Set(), sessions = new Map(), seenSessions = new Set();
   const uuid = value => typeof value === 'string' && /^[0-9a-f-]{36}$/i.test(value);
-  const word = value => typeof value === 'string' && /^[0-9a-f]{32}$/.test(value);
   function paired(entry, phase, party, contribution, finish) {
     let round = entry[phase];
     if (!round) {
@@ -33,7 +33,7 @@ export function createHelperState(size) {
     });
   }
   function projected(evaluation) {
-    return { flags: evaluation.flags, values: Uint8Array.from(evaluation.values, value => value[DPF_VALUE_BYTE] & 1) };
+    return { flags: evaluation.flags, values: evaluation.values };
   }
   return async function handle(path, body, party) {
     if (path === '/internal/preprocess') {
@@ -75,28 +75,35 @@ export function createHelperState(size) {
         throw new Error('Helper read contributions disagree');
       }
       return paired(entry, 'read', party, true, () => {
-        const rho = randomBytes(1)[0] & 1;
-        let gamma0 = rho, gamma1 = rho;
+        const rho = randomBytes(BLOCK_BYTES);
+        const gamma0 = Buffer.from(rho), gamma1 = Buffer.from(rho);
         for (let i = 0; i < size; i++) {
-          gamma0 ^= blinds[0][i] & entry.material.shares[1].flags[i ^ entry.shift];
-          gamma1 ^= blinds[1][i] & entry.material.shares[0].flags[i ^ entry.shift];
+          const mask0 = -entry.material.shares[1].flags[i ^ entry.shift];
+          const mask1 = -entry.material.shares[0].flags[i ^ entry.shift];
+          for (let byte = 0; byte < BLOCK_BYTES; byte++) {
+            gamma0[byte] ^= blinds[0][i * BLOCK_BYTES + byte] & mask0;
+            gamma1[byte] ^= blinds[1][i * BLOCK_BYTES + byte] & mask1;
+          }
         }
         if (entry.operation === 'access') sessions.delete(body.id);
-        return [{ gamma: gamma0, version }, { gamma: gamma1, version }];
+        return [{ gamma: gamma0.toString('hex'), version }, { gamma: gamma1.toString('hex'), version }];
       });
     }
     if (path === '/internal/stage-update') {
       const entry = sessions.get(body.id);
       if (!entry || entry.operation !== 'insert' || entry.read?.inputs.length !== 2 || entry.version !== version ||
-          !Array.isArray(body.finalBlinds) || body.finalBlinds.length !== 2 || !body.finalBlinds.every(word)) {
+          !Array.isArray(body.finalBlinds) || body.finalBlinds.length !== 2 || !body.finalBlinds.every(isBlockHex)) {
         throw new Error('Helper update state unavailable');
       }
       return paired(entry, 'update', party, body.finalBlinds, inputs => {
         if (JSON.stringify(inputs[0]) !== JSON.stringify(inputs[1])) throw new Error('Helper update corrections disagree');
         entry.staged = blinds.map((blind, p) => {
-          const correction = Buffer.from(inputs[0][p], 'hex')[DPF_VALUE_BYTE] & 1;
+          const correction = Buffer.from(inputs[0][p], 'hex');
           const dpf = entry.material.shares[p];
-          return blind.map((bit, i) => bit ^ dpf.values[i ^ entry.shift] ^ (dpf.flags[i ^ entry.shift] & correction));
+          return blind.map((byte, offset) => {
+            const i = Math.floor(offset / BLOCK_BYTES), b = offset % BLOCK_BYTES;
+            return byte ^ dpf.values[i ^ entry.shift][b] ^ (-dpf.flags[i ^ entry.shift] & correction[b]);
+          });
         });
         return [{ staged: true }, { staged: true }];
       });

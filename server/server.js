@@ -5,10 +5,11 @@ import { readFileSync } from 'node:fs';
 import { answerInitiatorRound, completeResponderRound } from './crypto/and-round-store.js';
 import { exchangeDpfControl } from './crypto/dpf-control-store.js';
 import { setupInThread, stopSetupThread, runInitiatorSetupInThread } from './crypto/ot-setup-thread.js';
-import { runSharedBitOperation } from './crypto/operation.js';
+import { runSharedBlockOperation } from './crypto/operation.js';
 import { beginPreprocessing, generatePreprocessedDpf, consumePreprocessing } from './crypto/preprocessing.js';
 import { requestHelper } from './crypto/dealer-client.js';
 import { exchangeRead } from './crypto/read-round-store.js';
+import { BLOCK_BYTES, BLOCK_BITS, MAX_TEXT_BYTES, DEFAULT_DB_SIZE, ZERO_BLOCK_HEX, isBlockHex } from '../shared/block-format.js';
 
 const role = process.argv[2];
 if (!['a', 'b'].includes(role)) throw new Error('Start as: node server/server.js a|b');
@@ -22,10 +23,10 @@ const peerPort = role === 'a' ? portB : portA;
 const listenHost = process.env.DUORAM_HOST || '127.0.0.1';
 const defaultPeerScheme = process.env.DUORAM_TLS_KEY_PATH ? 'https' : 'http';
 const peerUrl = new URL(process.env.DUORAM_PEER_URL || `${defaultPeerScheme}://127.0.0.1:${peerPort}`);
-const SIZE = Number(process.env.DB_SIZE || 2 ** 16);
-if (!Number.isSafeInteger(SIZE) || SIZE < 1 || SIZE > 1_000_000) throw new Error('DB_SIZE must be an integer from 1 to 1,000,000');
+const SIZE = Number(process.env.DB_SIZE || DEFAULT_DB_SIZE);
+if (!Number.isSafeInteger(SIZE) || SIZE < 2 || SIZE > 16384 || (SIZE & (SIZE - 1)) !== 0) throw new Error('DB_SIZE must be a power of two from 2 to 16384');
 const DOMAIN_BITS = Math.max(1, Math.ceil(Math.log2(SIZE)));
-const PROTOCOL_WIRE_VERSION = 'duoram-three-party-blinded-aes-bit-v13';
+const PROTOCOL_WIRE_VERSION = 'duoram-three-party-blinded-aes-block-v14';
 let preprocessingMode = process.env.DUORAM_PREPROCESSING_MODE || 'dealer';
 if (!['dealer', 'ot'].includes(preprocessingMode)) throw new Error('DUORAM_PREPROCESSING_MODE must be dealer or ot');
 const INSTANCE_ID = randomUUID();
@@ -73,10 +74,10 @@ function closeRuntimeGate(error) {
 }
 
 // A hardcoded zero database. Each party initially owns a zero XOR share.
-const databaseShare = new Uint8Array(SIZE);
+const databaseShare = new Uint8Array(SIZE * BLOCK_BYTES);
 // Public-zero initial state: blinded copies and helper blinds start at zero.
-const blindShare = new Uint8Array(SIZE);
-const peerBlindedShare = new Uint8Array(SIZE);
+const blindShare = new Uint8Array(SIZE * BLOCK_BYTES);
+const peerBlindedShare = new Uint8Array(SIZE * BLOCK_BYTES);
 let blindVersion = 0, helperInstanceId = null;
 const clientInputs = new Map();
 const backgroundOperations = new Map();
@@ -231,7 +232,7 @@ function rememberResult(sessionId, result) {
 }
 
 async function runPartyOperation(sessionId, operation, indexShareBits, valueShare, preprocessing) {
-  return runSharedBitOperation({
+  return runSharedBlockOperation({
     party: role === 'a' ? 0 : 1,
     sessionId,
     operation,
@@ -404,6 +405,9 @@ const requestHandler = async (req, res) => {
       return json(res, 200, {
         role,
         size: SIZE,
+        blockBytes: BLOCK_BYTES,
+        blockBits: BLOCK_BITS,
+        maxTextBytes: MAX_TEXT_BYTES,
         domainBits: DOMAIN_BITS,
         ready: true,
         secureOram: false,
@@ -435,6 +439,7 @@ const requestHandler = async (req, res) => {
           if (preparedItem) {
             await sendPeer('/internal/preprocess/abort', { preprocessingId: preparedItem.id });
             await sendHelper('/internal/discard', { id: preparedItem.id });
+            preparedItem.writePool?.discard();
             preparedItem = null;
           }
           await sendPeer('/internal/preprocess/mode', { mode });
@@ -448,8 +453,8 @@ const requestHandler = async (req, res) => {
 
     if (req.method === 'POST' && req.url === '/api/share') {
       if (role !== 'b' || !operationsEnabled()) return json(res, 501, { error: 'Secure operations are disabled' });
-      const { sessionId, indexShareBits, valueShare = 0, resultToken } = await parseBody(req);
-      if (!validSessionId(sessionId) || !validBits(indexShareBits, DOMAIN_BITS) || (valueShare !== 0 && valueShare !== 1) ||
+      const { sessionId, indexShareBits, valueShare = ZERO_BLOCK_HEX, resultToken } = await parseBody(req);
+      if (!validSessionId(sessionId) || !validBits(indexShareBits, DOMAIN_BITS) || !isBlockHex(valueShare) ||
           typeof resultToken !== 'string' || !/^[0-9a-f]{64}$/i.test(resultToken)) {
         return json(res, 400, { error: 'Invalid client shares' });
       }
@@ -483,7 +488,7 @@ const requestHandler = async (req, res) => {
       if (!validSessionId(sessionId) || !validBits(indexShareBits, DOMAIN_BITS)) return json(res, 400, { error: 'Invalid client shares' });
       return await enqueueClientOperation(res, async () => {
         if (!operationsEnabled()) return json(res, 501, { error: 'Secure operations are disabled' });
-        const result = await runCoordinatorOperation(sessionId, 'access', indexShareBits, 0);
+        const result = await runCoordinatorOperation(sessionId, 'access', indexShareBits, ZERO_BLOCK_HEX);
         json(res, 200, { sessionId, share: result.share, validityShare: result.validityShare });
       });
     }
@@ -491,13 +496,13 @@ const requestHandler = async (req, res) => {
     if (req.method === 'POST' && req.url === '/api/insert') {
       if (role !== 'a' || !operationsEnabled()) return json(res, 501, { error: 'Secure operations are disabled' });
       const { sessionId, indexShareBits, valueShare } = await parseBody(req);
-      if (!validSessionId(sessionId) || !validBits(indexShareBits, DOMAIN_BITS) || (valueShare !== 0 && valueShare !== 1)) {
+      if (!validSessionId(sessionId) || !validBits(indexShareBits, DOMAIN_BITS) || !isBlockHex(valueShare)) {
         return json(res, 400, { error: 'Invalid client shares' });
       }
       return await enqueueClientOperation(res, async () => {
         if (!operationsEnabled()) return json(res, 501, { error: 'Secure operations are disabled' });
         const result = await runCoordinatorOperation(sessionId, 'insert', indexShareBits, valueShare);
-        json(res, 200, { sessionId, ok: true, validityShare: result.validityShare });
+        json(res, 200, { sessionId, ok: true, validityShare: result.validityShare, acceptedShare: result.acceptedShare });
       });
     }
 
@@ -603,7 +608,7 @@ const requestHandler = async (req, res) => {
       }
       if (role === 'b' && req.url === '/internal/preprocess/abort') {
         const entry = responderPreprocessing.get(body.preprocessingId);
-        if (entry) clearTimeout(entry.timer);
+        if (entry) { clearTimeout(entry.timer); entry.item.writePool?.discard(); }
         responderPreprocessing.delete(body.preprocessingId);
         return json(res, 200, { discarded: true });
       }
@@ -634,7 +639,7 @@ const requestHandler = async (req, res) => {
               if (stagedDatabaseShares.size >= MAX_BACKGROUND_OPERATIONS) throw new Error('Too many staged database updates');
               const staged = {
                 state: result,
-                result: { ok: true, validityShare: result.validityShare },
+                result: { ok: true, validityShare: result.validityShare, acceptedShare: result.acceptedShare },
                 cleanupTimer: null,
               };
               staged.cleanupTimer = setTimeout(() => {
