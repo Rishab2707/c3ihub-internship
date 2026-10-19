@@ -34,6 +34,39 @@ The **DPF preprocessing** button selects **Third-party triples** (default) or **
 
 This demo hides indices and contents under the one-passive-corrupted-party, no-collusion model. It does **not** hide browser IP addresses, connection timing, or other network identity metadata. Anonymous posting needs a separate transport design. The complete handwritten cryptographic composition has not been independently audited; the local launcher explicitly enables the research prototype on loopback HTTP.
 
+## Default sizes (in bits)
+
+These sizes use the default **1,024 slots**, **1,024-bit blocks** and **10-level DPF trees**. Up to **1,024 posts** can be inserted, one per slot; an empty string also occupies a slot. Array sizes below exclude JavaScript object overhead and wire encoding.
+
+| Item | Size in bits | Meaning |
+| --- | ---: | --- |
+| Standard ASCII character | 7 | ASCII character code width |
+| Stored ASCII character | 8 | One byte per character; reconstructed high bit is zero |
+| Occupied marker per block | 8 | One byte storing 0 or 1 |
+| Text-length field per block | 8 | One byte storing a length from 0 to 126 |
+| Total metadata per block | 16 | Occupied marker plus text length |
+| Text and padding region per block | 1,008 | Up to 126 ASCII characters; unused bytes are zero-padded |
+| Complete block / post slot | 1,024 | Metadata plus fixed-length text region |
+| Index / each logical XOR index share | 10 | Addresses slots 0-1023; API encodes shares as arrays of bits |
+| Logical database | 1,048,576 | 1,024 slots times 1,024 bits |
+| Database share at each database server | 1,048,576 | A/B hold full-size XOR shares, not half-size arrays |
+| Database share, own blind and cached peer share together, per database server | 3,145,728 | Three full-size arrays; excludes preprocessing |
+| DPF leaf seed before final PRG expansion | 128 | Seed block with its reserved low bit cleared; control flag is separate |
+| DPF tree seed correction word | 128 | Each level also has two one-bit control corrections |
+| All leaf seeds for one component / party | 131,072 | 1,024 seeds times 128 bits; transient before final output conversion |
+| Expanded DPF leaf value | 1,024 | AES-CTR expansion of one 128-bit seed |
+| DPF flag per leaf | 1 logical; 8 stored | Current implementation uses one Uint8Array byte per flag |
+| All flags for one component / party | 1,024 logical; 8,192 stored | 1,024 flags |
+| Expanded value array before final value correction, per component / party | 1,048,576 | 1,024 expanded leaves times 1,024 bits |
+| Update-share array after final value correction, per component / party | 1,048,576 | Correction changes values, not array length or block width |
+| Three retained expanded value arrays per prepared access / database server | 3,145,728 | Read, Blind0 and Blind1; excludes flags and multiplication correlations |
+| Retained XOR reduction / correction contribution / final value correction, each | 1,024 | One block for each of these quantities, per component |
+| Three final value corrections together | 3,072 | One 1,024-bit correction for each component |
+
+For a post of length `L`, its characters occupy `8 * L` bits and its padding occupies `1,008 - 8 * L` bits. The complete block remains 1,024 bits. Each component has **1,024 leaves**, so each database server retains **3,072 expanded leaf entries** across its three prepared components. The flags and expanded leaf values are separate arrays. Neither PRG expansion nor the final correction increases the seed's entropy.
+
+Changing `DB_SIZE` changes the slot count, index width, tree depth and array totals; it does not change the current block, character, metadata or final value-correction widths.
+
 ## Sharing and stored state
 
 The browser encodes text into a fixed-length block and samples fresh, uniformly random XOR shares of the entire block, including its header and padding. It also XOR-shares the index. A receives only its shares; B receives only its shares. Read outputs and write-acceptance bits are reconstructed in the browser.
